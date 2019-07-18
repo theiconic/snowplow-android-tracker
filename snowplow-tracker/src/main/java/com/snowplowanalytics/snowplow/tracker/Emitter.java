@@ -43,6 +43,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedList;
+import java.util.List;
 import java.util.Map;
 import java.util.EnumSet;
 import java.util.concurrent.Callable;
@@ -67,12 +68,14 @@ public class Emitter {
 
     private Context context;
     private Uri.Builder uriBuilder;
+    private Uri.Builder uriBuilderRealTime;
     private RequestCallback requestCallback;
     private HttpMethod httpMethod;
     private BufferOption bufferOption;
     private RequestSecurity requestSecurity;
     private EnumSet<TLSVersion> tlsVersions;
     private String uri;
+    private String uriRealTime;
     private int emitterTick;
     private int emptyLimit;
     private int sendLimit;
@@ -91,6 +94,7 @@ public class Emitter {
     public static class EmitterBuilder {
 
         final String uri; // Required
+        String uriRealTime;
         final Context context; // Required
         RequestCallback requestCallback = null; // Optional
         HttpMethod httpMethod = HttpMethod.POST; // Optional
@@ -110,6 +114,17 @@ public class Emitter {
          */
         public EmitterBuilder(String uri, Context context) {
             this.uri = uri;
+            this.context = context;
+        }
+
+        /**
+         * @param uri         The uri of the collector
+         * @param uriRealTime The uri of the real time collector
+         * @param context     The android context
+         */
+        public EmitterBuilder(String uri, String uriRealTime, Context context) {
+            this.uri = uri;
+            this.uriRealTime = uriRealTime;
             this.context = context;
         }
 
@@ -252,6 +267,7 @@ public class Emitter {
         this.byteLimitGet = builder.byteLimitGet;
         this.byteLimitPost = builder.byteLimitPost;
         this.uri = builder.uri;
+        this.uriRealTime = builder.uriRealTime;
         this.timeUnit = builder.timeUnit;
         this.eventStore = new EventStore(this.context, this.sendLimit);
 
@@ -274,16 +290,25 @@ public class Emitter {
     private void buildEmitterUri() {
         if (this.requestSecurity == RequestSecurity.HTTP) {
             this.uriBuilder = Uri.parse("http://" + this.uri).buildUpon();
-        }
-        else {
+            if (uriRealTime != null) {
+                this.uriBuilderRealTime = Uri.parse("http://" + this.uriRealTime).buildUpon();
+            }
+        } else {
             this.uriBuilder = Uri.parse("https://" + this.uri).buildUpon();
+            if (uriRealTime != null) {
+                this.uriBuilderRealTime = Uri.parse("https://" + this.uriRealTime).buildUpon();
+            }
         }
         if (this.httpMethod == HttpMethod.GET) {
             uriBuilder.appendPath("i");
-        }
-        else {
-            uriBuilder.appendEncodedPath(TrackerConstants.PROTOCOL_VENDOR + "/" +
-                    TrackerConstants.PROTOCOL_VERSION);
+            if (uriRealTime != null) {
+                uriBuilderRealTime.appendPath("i");
+            }
+        } else {
+            uriBuilder.appendEncodedPath(TrackerConstants.PROTOCOL_VENDOR + "/" + TrackerConstants.PROTOCOL_VERSION);
+            if (uriRealTime != null) {
+                uriBuilderRealTime.appendEncodedPath(TrackerConstants.PROTOCOL_VENDOR + "/" + TrackerConstants.PROTOCOL_VERSION);
+            }
         }
     }
 
@@ -539,6 +564,11 @@ public class Emitter {
                 boolean oversize = payload.getByteSize() + POST_STM_BYTES > byteLimitGet;
                 Request request = requestBuilderGet(payload);
                 requests.add(new ReadyRequest(oversize, request, reqEventId));
+
+                if (uriBuilderRealTime != null) {
+                    Request realTimeRequest = requestRealTimeBuilderGet(payload);
+                    requests.add(new ReadyRequest(oversize, realTimeRequest, reqEventId));
+                }
             }
         } else {
             for (int i = 0; i < payloadCount; i += bufferOption.getCode()) {
@@ -560,11 +590,21 @@ public class Emitter {
                         reqEventId.add(eventIds.get(j));
                         Request request = requestBuilderPost(singlePayloadMap);
                         requests.add(new ReadyRequest(true, request, reqEventId));
-                    }
-                    else if ((totalByteSize + payloadByteSize + POST_WRAPPER_BYTES +
-                            (postPayloadMaps.size() -1)) > byteLimitPost) {
+
+                        if (uriBuilderRealTime != null) {
+                            Request realTimeRequest = requestRealTimeBuilderPost(singlePayloadMap);
+                            requests.add(new ReadyRequest(true, realTimeRequest, reqEventId));
+                        }
+
+                    } else if ((totalByteSize + payloadByteSize + POST_WRAPPER_BYTES +
+                            (postPayloadMaps.size() - 1)) > byteLimitPost) {
                         Request request = requestBuilderPost(postPayloadMaps);
                         requests.add(new ReadyRequest(false, request, reqEventIds));
+
+                        if (uriBuilderRealTime != null) {
+                            Request realTimeRequest = requestRealTimeBuilderPost(postPayloadMaps);
+                            requests.add(new ReadyRequest(false, realTimeRequest, reqEventIds));
+                        }
 
                         // Clear collections and build a new POST
                         postPayloadMaps = new ArrayList<>();
@@ -586,6 +626,12 @@ public class Emitter {
                 if (!postPayloadMaps.isEmpty()) {
                     Request request = requestBuilderPost(postPayloadMaps);
                     requests.add(new ReadyRequest(false, request, reqEventIds));
+
+                    if (uriBuilderRealTime != null) {
+                        Request realTimeRequest = requestRealTimeBuilderPost(postPayloadMaps);
+                        requests.add(new ReadyRequest(false, realTimeRequest, reqEventIds));
+                    }
+
                 }
             }
         }
@@ -625,13 +671,45 @@ public class Emitter {
     }
 
     /**
+     * Builds an OkHttp GET request which is ready
+     * to be executed.
+     *
+     * @param payload The payload to be sent in the
+     *                request.
+     * @return an OkHttp request object
+     */
+    @SuppressWarnings("unchecked")
+    private Request requestRealTimeBuilderGet(Payload payload) {
+        addStmToEvent(payload, "");
+
+        // Clear the previous query
+        uriBuilderRealTime.clearQuery();
+
+        // Build the request query
+        HashMap hashMap = (HashMap) payload.getMap();
+
+        for (String key : (Iterable<String>) hashMap.keySet()) {
+            String value = (String) hashMap.get(key);
+            uriBuilderRealTime.appendQueryParameter(key, value);
+        }
+
+        // Build the request
+        String reqUrl = uriBuilderRealTime.build().toString();
+        return new Request.Builder()
+                .url(reqUrl)
+                .get()
+                .build();
+    }
+
+    /**
      * Builds an OkHttp POST request which is ready
      * to be executed.
+     *
      * @param payloads The payloads to be sent in the
      *                 request.
      * @return an OkHttp request object
      */
-    private Request requestBuilderPost(ArrayList<Payload> payloads) {
+    private Request requestBuilderPost(List<Payload> payloads) {
         ArrayList<Map> finalPayloads = new ArrayList<>();
         String stm = Util.getTimestamp();
         for (Payload payload : payloads) {
@@ -642,6 +720,33 @@ public class Emitter {
         SelfDescribingJson postPayload =
                 new SelfDescribingJson(TrackerConstants.SCHEMA_PAYLOAD_DATA, finalPayloads);
         String reqUrl = uriBuilder.build().toString();
+        RequestBody reqBody = RequestBody.create(JSON, postPayload.toString());
+        return new Request.Builder()
+                .url(reqUrl)
+                .post(reqBody)
+                .build();
+    }
+
+
+    /**
+     * Builds an OkHttp POST request which is ready
+     * to be executed.
+     *
+     * @param payloads The payloads to be sent in the
+     *                 request.
+     * @return an OkHttp request object
+     */
+    private Request requestRealTimeBuilderPost(ArrayList<Payload> payloads) {
+        ArrayList<Map> finalPayloads = new ArrayList<>();
+        String stm = Util.getTimestamp();
+        for (Payload payload : payloads) {
+            addStmToEvent(payload, stm);
+            finalPayloads.add(payload.getMap());
+        }
+
+        SelfDescribingJson postPayload =
+                new SelfDescribingJson(TrackerConstants.SCHEMA_PAYLOAD_DATA, finalPayloads);
+        String reqUrl = uriBuilderRealTime.build().toString();
         RequestBody reqBody = RequestBody.create(JSON, postPayload.toString());
         return new Request.Builder()
                 .url(reqUrl)
@@ -741,6 +846,13 @@ public class Emitter {
      */
     public String getEmitterUri() {
         return this.uriBuilder.clearQuery().build().toString();
+    }
+
+    /**
+     * @return the emitter real time uri
+     */
+    public String getEmitterRealTimeUri() {
+        return this.uriBuilderRealTime.clearQuery().build().toString();
     }
 
     /**
