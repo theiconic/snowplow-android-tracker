@@ -61,6 +61,7 @@ public class Emitter {
     private RequestSecurity requestSecurity;
     private EnumSet<TLSVersion> tlsVersions;
     private String uri;
+    private String uriRealTime;
     private int emitterTick;
     private int emptyLimit;
     private int sendLimit;
@@ -72,6 +73,7 @@ public class Emitter {
     private OkHttpClient client;
 
     private NetworkConnection networkConnection;
+    private NetworkConnection realTimeNetworkConnection;
     private EventStore eventStore;
     private int emptyCount;
 
@@ -82,6 +84,7 @@ public class Emitter {
      */
     public static class EmitterBuilder {
         final String uri; // Required
+        String uriRealTime;
         final Context context; // Required
         RequestCallback requestCallback = null; // Optional
         HttpMethod httpMethod = POST; // Optional
@@ -101,11 +104,22 @@ public class Emitter {
         EventStore eventStore = null; // Optional
 
         /**
-         * @param uri The uri of the collector
+         * @param uri     The uri of the collector
          * @param context the android context
          */
         public EmitterBuilder(String uri, Context context) {
             this.uri = uri;
+            this.context = context;
+        }
+
+        /**
+         * @param uri         The uri of the collector
+         * @param uriRealTime The uri of the real time collector
+         * @param context     The android context
+         */
+        public EmitterBuilder(String uri, String uriRealTime, Context context) {
+            this.uri = uri;
+            this.uriRealTime = uriRealTime;
             this.context = context;
         }
 
@@ -234,7 +248,7 @@ public class Emitter {
          *                    TimeOutException will be thrown
          * @return itself
          */
-        public EmitterBuilder emitTimeout(int emitTimeout){
+        public EmitterBuilder emitTimeout(int emitTimeout) {
             this.emitTimeout = emitTimeout;
             return this;
         }
@@ -297,6 +311,7 @@ public class Emitter {
         this.byteLimitPost = builder.byteLimitPost;
         this.emitTimeout = builder.emitTimeout;
         this.uri = builder.uri;
+        this.uriRealTime = builder.uriRealTime;
         this.timeUnit = builder.timeUnit;
         this.eventStore = null;
         this.customPostPath = builder.customPostPath;
@@ -317,6 +332,18 @@ public class Emitter {
                     .customPostPath(builder.customPostPath)
                     .client(builder.client)
                     .build();
+
+            if (uriRealTime != null) {
+                this.realTimeNetworkConnection = new OkHttpNetworkConnection
+                        .OkHttpNetworkConnectionBuilder(builder.uriRealTime)
+                        .security(builder.requestSecurity)
+                        .method(builder.httpMethod)
+                        .tls(builder.tlsVersions)
+                        .emitTimeout(builder.emitTimeout)
+                        .customPostPath(builder.customPostPath)
+                        .client(builder.client)
+                        .build();
+            }
         } else {
             this.networkConnection = builder.networkConnection;
         }
@@ -397,16 +424,16 @@ public class Emitter {
     /**
      * Attempts to send events in the database to
      * a collector.
-     *
+     * <p>
      * - If the emitter is not online it will not send
      * - If the emitter is online but there are no events:
-     *   + Increment empty counter until emptyLimit reached
-     *   + Incurs a backoff period between empty counters
+     * + Increment empty counter until emptyLimit reached
+     * + Incurs a backoff period between empty counters
      * - If the emitter is online and we have events:
-     *   + Pulls allowed amount of events from database and
-     *     attempts to send.
-     *   + If there are failures resets running state
-     *   + Otherwise will attempt to emit again
+     * + Pulls allowed amount of events from database and
+     * attempts to send.
+     * + If there are failures resets running state
+     * + Otherwise will attempt to emit again
      */
     @SuppressWarnings("all")
     private void attemptEmit() {
@@ -436,7 +463,9 @@ public class Emitter {
         List<EmitterEvent> events = eventStore.getEmittableEvents(sendLimit);
         List<Request> requests = buildRequests(events);
         List<RequestResult> results = networkConnection.sendRequests(requests);
-
+        if (uriRealTime != null) {
+            results.addAll(realTimeNetworkConnection.sendRequests(requests));
+        }
         Logger.v(TAG, "Processing emitter results.");
 
         int successCount = 0;
@@ -490,12 +519,13 @@ public class Emitter {
         List<Request> requests = new ArrayList<>();
         String sendingTime = Util.getTimestamp();
         HttpMethod httpMethod = networkConnection.getHttpMethod();
+        HttpMethod httpMethodRealTime = realTimeNetworkConnection.getHttpMethod();
 
         if (httpMethod == GET) {
             for (EmitterEvent event : events) {
                 Payload payload = event.payload;
                 addSendingTimeToPayload(payload, sendingTime);
-                boolean isOversize = isOversize(payload);
+                boolean isOversize = isOversize(networkConnection, payload);
                 Request request = new Request(payload, event.eventId, isOversize);
                 requests.add(request);
             }
@@ -510,11 +540,11 @@ public class Emitter {
                     Long eventId = event.eventId;
                     addSendingTimeToPayload(payload, sendingTime);
 
-                    if (isOversize(payload)) {
+                    if (isOversize(networkConnection, payload)) {
                         Request request = new Request(payload, eventId, true);
                         requests.add(request);
 
-                    } else if (isOversize(payload, postPayloadMaps)) {
+                    } else if (isOversize(networkConnection, payload, postPayloadMaps)) {
                         Request request = new Request(postPayloadMaps, reqEventIds);
                         requests.add(request);
 
@@ -539,33 +569,87 @@ public class Emitter {
                 }
             }
         }
+
+        if (uriRealTime != null) {
+            if (httpMethodRealTime == GET) {
+                for (EmitterEvent event : events) {
+                    Payload payload = event.payload;
+                    addSendingTimeToPayload(payload, sendingTime);
+                    boolean isOversize = isOversize(realTimeNetworkConnection, payload);
+                    Request request = new Request(payload, event.eventId, isOversize);
+                    requests.add(request);
+                }
+            } else {
+                for (int i = 0; i < events.size(); i += bufferOption.getCode()) {
+                    List<Long> reqEventIds = new ArrayList<>();
+                    List<Payload> postPayloadMaps = new ArrayList<>();
+
+                    for (int j = i; j < (i + bufferOption.getCode()) && j < events.size(); j++) {
+                        EmitterEvent event = events.get(j);
+                        Payload payload = event.payload;
+                        Long eventId = event.eventId;
+                        addSendingTimeToPayload(payload, sendingTime);
+
+                        if (isOversize(realTimeNetworkConnection, payload)) {
+                            Request request = new Request(payload, eventId, true);
+                            requests.add(request);
+
+                        } else if (isOversize(realTimeNetworkConnection, payload, postPayloadMaps)) {
+                            Request request = new Request(postPayloadMaps, reqEventIds);
+                            requests.add(request);
+
+                            // Clear collections and build a new POST
+                            postPayloadMaps = new ArrayList<>();
+                            reqEventIds = new ArrayList<>();
+
+                            // Build and store the request
+                            postPayloadMaps.add(payload);
+                            reqEventIds.add(eventId);
+
+                        } else {
+                            postPayloadMaps.add(payload);
+                            reqEventIds.add(eventId);
+                        }
+                    }
+
+                    // Check if all payloads have been processed
+                    if (!postPayloadMaps.isEmpty()) {
+                        Request request = new Request(postPayloadMaps, reqEventIds);
+                        requests.add(request);
+                    }
+                }
+            }
+        }
         return requests;
     }
 
     /**
      * Calculate if the payload exceeds the maximum amount of bytes allowed on configuration.
+     *
      * @param payload to send.
      * @return weather the payload exceeds the maximum size allowed.
      */
-    private boolean isOversize(@NonNull Payload payload) {
-        return isOversize(payload, new ArrayList<>());
+    private boolean isOversize(NetworkConnection connection, @NonNull Payload payload) {
+        return isOversize(connection, payload, new ArrayList<>());
     }
 
     /**
      * Calculate if the payload bundle exceeds the maximum amount of bytes allowed on configuration.
-     * @param payload to add om the payload bundle.
+     *
+     * @param payload         to add om the payload bundle.
      * @param previousPaylods already in the payload bundle.
      * @return weather the payload bundle exceeds the maximum size allowed.
      */
-    private boolean isOversize(@NonNull Payload payload, @NonNull List<Payload> previousPaylods) {
-        long byteLimit = networkConnection.getHttpMethod() == GET ? byteLimitGet : byteLimitPost;
+    private boolean isOversize(NetworkConnection connection, @NonNull Payload payload, @NonNull List<Payload> previousPaylods) {
+        long byteLimit = connection.getHttpMethod() == GET ? byteLimitGet : byteLimitPost;
         return isOversize(payload, byteLimit, previousPaylods);
     }
 
     /**
      * Calculate if the payload bundle exceeds the maximum amount of bytes allowed on configuration.
-     * @param payload to add om the payload bundle.
-     * @param byteLimit maximum amount of bytes allowed.
+     *
+     * @param payload         to add om the payload bundle.
+     * @param byteLimit       maximum amount of bytes allowed.
      * @param previousPaylods already in the payload bundle.
      * @return weather the payload bundle exceeds the maximum size allowed.
      */
@@ -584,7 +668,7 @@ public class Emitter {
      * Adds the Sending Time (stm) field
      * to each event payload.
      *
-     * @param payload The payload to append the field to
+     * @param payload   The payload to append the field to
      * @param timestamp An optional timestamp String
      */
     private void addSendingTimeToPayload(@NonNull Payload payload, @NonNull String timestamp) {
@@ -621,6 +705,7 @@ public class Emitter {
 
     /**
      * Sets the maximum amount of events to grab for an emit attempt.
+     *
      * @param sendLimit The maximum possible amount of events.
      */
     public void setSendLimit(int sendLimit) {
@@ -685,10 +770,36 @@ public class Emitter {
     }
 
     /**
+     * Updates the URI for the Emitter
+     *
+     * @param uriRealTime new Emitter URI
+     */
+    public void setEmitterUriRealTime(String uriRealTime) {
+        if (!isRunning.get()) {
+            this.uriRealTime = uriRealTime;
+            this.networkConnection = new OkHttpNetworkConnection.OkHttpNetworkConnectionBuilder(uriRealTime)
+                    .security(requestSecurity)
+                    .method(httpMethod)
+                    .tls(tlsVersions)
+                    .emitTimeout(emitTimeout)
+                    .customPostPath(customPostPath)
+                    .client(client)
+                    .build();
+        }
+    }
+
+    /**
      * @return the emitter uri
      */
     public String getEmitterUri() {
         return networkConnection.getUri().toString();
+    }
+
+    /**
+     * @return the emitter RealTime uri
+     */
+    public String getEmitterRealTimeUri() {
+        return realTimeNetworkConnection.getUri().toString();
     }
 
     /**
@@ -735,7 +846,7 @@ public class Emitter {
 
     /**
      * @return the amount of times the event store can be empty
-     *         before it is shutdown.
+     * before it is shutdown.
      */
     public int getEmptyLimit() {
         return this.emptyLimit;
